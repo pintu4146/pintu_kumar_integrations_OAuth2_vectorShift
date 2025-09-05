@@ -1,0 +1,9 @@
+# Ignore node modules directory
+integrations_OAuth2/frontend/node_modules
+
+# Ignore venv directory
+integrations_OAuth2/backend/pin2/
+# Ignore backend chache 
+integrations_OAuth2/backend/integrations/__pycache__/
+integrations_OAuth2/backend/.idea/
+
