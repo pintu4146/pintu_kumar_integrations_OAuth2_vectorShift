@@ -9,3 +9,6 @@ integrations_OAuth2/backend/.idea/
 integrations_OAuth2/backend/__pycache__/
 integrations_OAuth2/backend/core/__pycache__/
 .idea/
+
+# Ignoring .env files
+integrations_OAuth2/backend/.env.dev

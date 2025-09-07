@@ -1,9 +1,11 @@
-from fastapi import FastAPI, Form, Request
+from typing import List
+from fastapi import FastAPI, Form, Request, status
 from dotenv import load_dotenv
 from core.middleware import setup_middleware
 from integrations.airtable import authorize_airtable, get_items_airtable, oauth2callback_airtable, get_airtable_credentials
 from integrations.notion import authorize_notion, get_items_notion, oauth2callback_notion, get_notion_credentials
 from integrations.hubspot import authorize_hubspot, get_hubspot_credentials, get_items_hubspot, oauth2callback_hubspot
+from integrations.integration_item import IntegrationItem
 
 # Load environment variables from .env file for local development
 load_dotenv()
@@ -67,6 +69,10 @@ async def oauth2callback_hubspot_integration(request: Request):
 async def get_hubspot_credentials_integration(user_id: str = Form(...), org_id: str = Form(...)):
     return await get_hubspot_credentials(user_id, org_id)
 
-@app.post('/integrations/hubspot/load')
+@app.post(
+    '/integrations/hubspot/load',
+    response_model=List[IntegrationItem],
+    status_code=status.HTTP_200_OK
+)
 async def get_hubspot_items_integration(credentials: str = Form(...)):
     return await get_items_hubspot(credentials)

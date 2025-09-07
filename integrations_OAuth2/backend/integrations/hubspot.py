@@ -1,4 +1,4 @@
-# slack.py
+# hubspot.py
 import json
 import secrets
 import asyncio
@@ -6,6 +6,7 @@ import base64
 from fastapi import Request, HTTPException
 from fastapi.responses import HTMLResponse
 import time
+import hashlib
 import httpx
 import os
 
@@ -15,16 +16,13 @@ from redis_client import add_key_value_redis, get_value_redis, delete_key_redis
 
 
 logger = get_logger(__name__)
-
+# given default values for easier local dev and vectorShift team evaluation, 
+# but in prod these must be set in .env.dev vars file
 CLIENT_ID = os.environ.get('HUBSPOT_CLIENT_ID', '64f2eb48-2bc2-4da3-9353-756774b07a6c')
 CLIENT_SECRET = os.environ.get('HUBSPOT_CLIENT_SECRET', 'fb187e7b-f70b-4dd9-a427-a0550f27885d')
 REDIRECT_URI = os.environ.get('HUBSPOT_REDIRECT_URI', 'http://localhost:8000/integrations/hubspot/oauth2callback')
 SCOPES = os.environ.get('HUBSPOT_SCOPES', 'oauth crm.objects.companies.read')
 
-REDIRECT_URI = 'http://localhost:8000/integrations/hubspot/oauth2callback'
-
-SCOPES = 'oauth crm.objects.companies.read'
- 
 if not CLIENT_ID or not CLIENT_SECRET:
     raise ValueError("HUBSPOT_CLIENT_ID and HUBSPOT_CLIENT_SECRET must be set in the environment.")
 
@@ -47,26 +45,62 @@ async def authorize_hubspot(user_id, org_id):
     """
     state = secrets.token_urlsafe(32)
     # Securely map the state to the user and org IDs
-    state_data = json.dumps({'user_id': user_id, 'org_id': org_id})
-    await add_key_value_redis(f'hubspot_state:{state}', state_data, expire=600)
+    state_data = json.dumps({'user_id': user_id, 'org_id': org_id})    
+    
+    # --- adding PKCE Parameters ---
+    code_verifier = secrets.token_urlsafe(32)
+    code_challenge_hash = hashlib.sha256(code_verifier.encode('utf-8')).digest()
+    code_challenge = base64.urlsafe_b64encode(code_challenge_hash).decode('utf-8').replace('=', '')
+    
+    # to make Oauth more secure and stateless associate the state with the user and org
+    # and store the code_verifier to be used later in the token exchange step
+    # so that Oauth callback will be independent of user and org context beforehand
+    await asyncio.gather(
+        add_key_value_redis(f'hubspot_state:{state}', state_data, expire=600),
+        add_key_value_redis(f'hubspot_verifier:{state}', code_verifier, expire=600)
+    )
+
     authorization_url = get_authorization_url()
-    final_url = f'{authorization_url}&state={state}'
-    logger.debug(f"Generated HubSpot authorization URL for user {user_id}")
+    final_url = (
+        f'{authorization_url}&state={state}'
+        f'&code_challenge={code_challenge}&code_challenge_method=S256'
+    )
+    logger.debug(f"Generated HubSpot authorization URL: {final_url} for user {user_id}")
     return final_url
 
+
+def _create_closing_html_response(error: str = None) -> HTMLResponse:
+    """Creates an HTML response that closes the window and optionally sends a message to the parent."""
+    message_script = ""
+    if error:
+        # Send an error message to the parent window before closing
+        message_script = f"""
+        if (window.opener) {{
+            window.opener.postMessage({{ "type": "oauth_error", "detail": "{error}" }}, "*");
+        }}
+        """
+    html_content = f"<html><body><script>{message_script}window.close();</script></body></html>"
+    return HTMLResponse(content=html_content)
 
 async def oauth2callback_hubspot(request: Request):
     """
     Handles the OAuth2 callback from HubSpot, exchanges the code for a token.
     """
     if request.query_params.get('error'):
-        raise HTTPException(status_code=400, detail=request.query_params.get('error_description', 'Unknown error'))
+        error_detail = request.query_params.get(
+            'error_description', 'Unknown error during HubSpot authorization.'
+        )
+        raise HTTPException(status_code=400, detail=error_detail)
     code = request.query_params.get('code')
     state = request.query_params.get('state')
     
-    state_data_json = await get_value_redis(f'hubspot_state:{state}')
-    if not state_data_json:
-        raise HTTPException(status_code=400, detail='State does not match or has expired.')
+    state_data_json, code_verifier = await asyncio.gather(
+        get_value_redis(f'hubspot_state:{state}'),
+        get_value_redis(f'hubspot_verifier:{state}')
+    )
+
+    if not state_data_json or not code_verifier:
+        return _create_closing_html_response(error='State does not match or has expired.')
 
     state_data = json.loads(state_data_json)
     user_id = state_data['user_id']
@@ -80,12 +114,14 @@ async def oauth2callback_hubspot(request: Request):
             'client_secret': CLIENT_SECRET,
             'redirect_uri': REDIRECT_URI,
             'code': code,
+            'code_verifier': code_verifier.decode('utf-8'),
         }
         headers = {'Content-Type': 'application/x-www-form-urlencoded;charset=utf-8'}
 
-        response, _ = await asyncio.gather(
+        response, _, _ = await asyncio.gather(
             client.post(token_url, data=payload, headers=headers),
-            delete_key_redis(f'hubspot_state:{state}')
+            delete_key_redis(f'hubspot_state:{state}'),
+            delete_key_redis(f'hubspot_verifier:{state}')
         )
 
         response.raise_for_status()
@@ -97,31 +133,33 @@ async def oauth2callback_hubspot(request: Request):
     # Store credentials without a Redis-level expiration. Token lifetime will be managed by the app.
     await add_key_value_redis(f'hubspot_credentials:{org_id}:{user_id}', json.dumps(credentials))
 
-    close_window_script = "<html><script>window.close();</script></html>"
-    return HTMLResponse(content=close_window_script)
+    return _create_closing_html_response()
 
 
 async def _get_refreshed_token(user_id: str, org_id: str, credentials: dict) -> dict:
     """Refreshes an expired HubSpot access token."""
     logger.info(f"Refreshing HubSpot token for user {user_id}")
     async with httpx.AsyncClient() as client:
-        response = await client.post(
-            'https://api.hubapi.com/oauth/v1/token',
-            data={
-                'grant_type': 'refresh_token',
-                'client_id': CLIENT_ID,
-                'client_secret': CLIENT_SECRET,
-                'refresh_token': credentials['refresh_token'],
-            }
-        )
+        token_url = 'https://api.hubapi.com/oauth/v1/token'
+        payload = {
+            'grant_type': 'refresh_token',
+            'client_id': CLIENT_ID,
+            'client_secret': CLIENT_SECRET,
+            'refresh_token': credentials['refresh_token'],
+        }
+        response = await client.post(token_url, data=payload)
         response.raise_for_status()
         new_credentials = response.json()
         # Preserve the original refresh token if a new one isn't provided
-        new_credentials['refresh_token'] = new_credentials.get('refresh_token', credentials['refresh_token'])
+        new_credentials['refresh_token'] = new_credentials.get(
+            'refresh_token', credentials['refresh_token']
+        )
         new_credentials['created_at'] = int(time.time())
         
         # Persist the newly refreshed credentials
-        await add_key_value_redis(f'hubspot_credentials:{org_id}:{user_id}', json.dumps(new_credentials))
+        await add_key_value_redis(
+            f'hubspot_credentials:{org_id}:{user_id}', json.dumps(new_credentials)
+        )
         return new_credentials
 
 
@@ -132,12 +170,17 @@ async def get_hubspot_credentials(user_id, org_id):
     """
     credentials_json = await get_value_redis(f'hubspot_credentials:{org_id}:{user_id}')
     if not credentials_json:
-        raise HTTPException(status_code=401, detail='No HubSpot credentials found. Please re-authenticate.')
+        raise HTTPException(
+            status_code=401, detail='No HubSpot credentials found. Please re-authenticate.'
+        )
     
     credentials = json.loads(credentials_json)
 
     # Refresh the token if it's expired or will expire in the next 5 minutes
-    if time.time() > credentials.get('created_at', 0) + credentials.get('expires_in', 0) - 300:
+    token_creation_time = credentials.get('created_at', 0)
+    token_expires_in = credentials.get('expires_in', 0)
+    is_token_expired = time.time() > (token_creation_time + token_expires_in - 300)
+    if is_token_expired:
         credentials = await _get_refreshed_token(user_id, org_id, credentials)
 
     logger.debug(f"Retrieved HubSpot credentials for user {user_id}")
@@ -162,7 +205,7 @@ def create_integration_item_metadata_object(item: dict, item_type: str) -> Integ
     )
 
 
-async def get_items_hubspot(credentials):
+async def get_items_hubspot(credentials) -> list[IntegrationItem]:
     """Fetches items (e.g., companies) from HubSpot and converts them to IntegrationItems."""
     # The credentials passed here are now just the access token from the frontend
     credentials = json.loads(credentials) 

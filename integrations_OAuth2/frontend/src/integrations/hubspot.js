@@ -15,6 +15,15 @@ export const HubSpotIntegration = ({ user, org, integrationParams, setIntegratio
     // Function to open OAuth in a new window
     const handleConnectClick = async () => {
         try {
+             // listener to the window to catch messages from the popup
+            const handleOauthMessage = (event) => {
+                if (event.data.type === 'oauth_error') {
+                    alert(`Connection failed: ${event.data.detail}`);
+                    setIsConnecting(false);
+                }
+                window.removeEventListener('message', handleOauthMessage);
+            };
+            window.addEventListener('message', handleOauthMessage);
             setIsConnecting(true);
             const formData = new FormData();
             formData.append('user_id', user);
