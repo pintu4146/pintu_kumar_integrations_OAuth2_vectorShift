@@ -2,8 +2,13 @@
 integrations_OAuth2/frontend/node_modules
 
 # Ignore venv directory
-integrations_OAuth2/backend/pin2/
+integrations_OAuth2/backend/pin3/
 # Ignore backend chache 
 integrations_OAuth2/backend/integrations/__pycache__/
 integrations_OAuth2/backend/.idea/
+integrations_OAuth2/backend/__pycache__/
+integrations_OAuth2/backend/core/__pycache__/
+.idea/
 
+# Ignoring .env files
+integrations_OAuth2/backend/.env.dev
